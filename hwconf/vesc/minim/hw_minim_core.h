@@ -280,6 +280,12 @@
 #ifndef APPCONF_SHUTDOWN_MODE
 #define APPCONF_SHUTDOWN_MODE			SHUTDOWN_MODE_TOGGLE_BUTTON_ONLY
 #endif
+// Rejoin UAVCAN (and keep VESC forwarding) after an app config reset. The
+// per-unit uavcan_esc_index still needs to be set on the ESC; this only makes
+// a reset ESC come back on the bus instead of falling to pure VESC mode.
+#ifndef APPCONF_CAN_MODE
+#define APPCONF_CAN_MODE				CAN_MODE_VESC_UAVCAN
+#endif
 #ifndef MCCONF_L_MAX_ABS_CURRENT
 #define MCCONF_L_MAX_ABS_CURRENT		80.0
 #endif
