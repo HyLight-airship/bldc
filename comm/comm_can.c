@@ -647,7 +647,11 @@ void comm_can_set_handbrake_rel(uint8_t controller_id, float current_rel) {
  */
 bool comm_can_ping(uint8_t controller_id, HW_TYPE *hw_type) {
 #if CAN_ENABLE
-	if (app_get_configuration()->can_mode != CAN_MODE_VESC) {
+	// Allow bus scanning in hybrid VESC+UAVCAN mode too, not only pure VESC
+	// mode. Target nodes already answer PING in VESC_UAVCAN; this lets the
+	// connected node emit the pings so Scan CAN works without leaving UAVCAN.
+	if (app_get_configuration()->can_mode != CAN_MODE_VESC &&
+			app_get_configuration()->can_mode != CAN_MODE_VESC_UAVCAN) {
 		return false;
 	}
 
