@@ -59,6 +59,11 @@ uint16_t VirtAddVarTab[NB_OF_VAR];
 bool conf_general_permanent_nrf_found = false;
 __attribute__((section(".ram4"))) volatile backup_data g_backup;
 
+// Latched true when the stored motor or app config failed its CRC check at boot
+// and the generic defaults had to be loaded. Reported out over UAVCAN so the
+// autopilot can raise a pilot alert; does not affect motor fault handling.
+static volatile bool m_conf_loaded_defaults = false;
+
 // Private functions
 static bool read_eeprom_var(eeprom_var *v, int address, uint16_t base);
 static bool store_eeprom_var(eeprom_var *v, int address, uint16_t base);
@@ -136,9 +141,11 @@ __attribute__((section(".text2"))) void conf_general_init(void) {
 		if (g_backup.can_init_flag == BACKUP_VAR_INIT_CODE) {
 			backup_tmp.can_baud = g_backup.can_baud;
 			backup_tmp.can_id = g_backup.can_id;
+			backup_tmp.uavcan_esc_index = g_backup.uavcan_esc_index;
 		} else {
 			backup_tmp.can_baud = APPCONF_CAN_BAUD_RATE;
 			backup_tmp.can_id = HW_DEFAULT_ID;
+			backup_tmp.uavcan_esc_index = APPCONF_UAVCAN_ESC_INDEX;
 		}
 	}
 
@@ -361,9 +368,11 @@ __attribute__((section(".text2"))) void conf_general_read_app_configuration(app_
 
 	// Set the default configuration
 	if (!is_ok) {
+		m_conf_loaded_defaults = true;
 		confgenerator_set_defaults_appconf(conf);
 		conf->can_baud_rate = g_backup.can_baud;
 		conf->controller_id = g_backup.can_id;
+		conf->uavcan_esc_index = g_backup.uavcan_esc_index;
 	}
 }
 
@@ -422,6 +431,7 @@ __attribute__((section(".text2"))) bool conf_general_store_app_configuration(app
 
 	g_backup.can_id = conf->controller_id;
 	g_backup.can_baud = conf->can_baud_rate;
+	g_backup.uavcan_esc_index = conf->uavcan_esc_index;
 	conf_general_store_backup_data();
 
 	return is_ok;
@@ -462,8 +472,14 @@ __attribute__((section(".text2"))) void conf_general_read_mc_configuration(mc_co
 	}
 
 	if (!is_ok) {
+		m_conf_loaded_defaults = true;
 		confgenerator_set_defaults_mcconf(conf);
 	}
+}
+
+// True if the stored motor or app config was invalid at boot and defaults were loaded.
+bool conf_general_config_was_reset(void) {
+	return m_conf_loaded_defaults;
 }
 
 /**

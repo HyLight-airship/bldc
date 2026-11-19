@@ -577,7 +577,14 @@ static void sendEscStatus(CanardInstance *ins) {
 		status.current = mc_interface_get_tot_current_in_filtered();
 	}
 
-	status.error_count = mc_interface_get_fault();
+	// Report the live motor fault, or surface a boot-time config-invalid state
+	// when no real fault is active so the autopilot can raise a pilot alert.
+	// This only affects the reported status, not motor fault handling.
+	mc_fault_code fault = mc_interface_get_fault();
+	if (fault == FAULT_CODE_NONE && conf_general_config_was_reset()) {
+		fault = FAULT_CODE_FLASH_CORRUPTION;
+	}
+	status.error_count = fault;
 	status.esc_index = app_get_configuration()->uavcan_esc_index;
 	status.power_rating_pct = (fabsf(mc_interface_get_tot_current()) /
 			conf->l_current_max * conf->l_current_max_scale) * 100.0;

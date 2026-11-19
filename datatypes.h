@@ -1464,7 +1464,9 @@ typedef struct __attribute__((packed)) {
 	uint8_t can_baud;
 	uint8_t can_id;
 
-	uint8_t dummy;
+	// Persisted so the per-unit UAVCAN ESC index survives an app config reset.
+	// Reuses the former padding byte, so the struct size is unchanged.
+	uint8_t uavcan_esc_index;
 } backup_data;
 
 #endif /* DATATYPES_H_ */
