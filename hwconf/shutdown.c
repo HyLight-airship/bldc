@@ -105,6 +105,11 @@ bool shutdown_sample_button(void) {
 }
 
 void shutdown_save_and_hold(void) {
+#ifdef HW_MINIM_FLIGHT
+	// The flight build never saves backup data or runs the shutdown sequence
+	return;
+#endif
+
 #ifdef USE_LISPBM
 	lispif_process_shutdown();
 #endif
@@ -118,6 +123,12 @@ void shutdown_save_and_hold(void) {
 }
 
 bool do_shutdown(bool resample) {
+#ifdef HW_MINIM_FLIGHT
+	// No path may release the power hold or the motor in the flight build
+	(void)resample;
+	return false;
+#endif
+
 	shutdown_save_and_hold();
 
 	bool disable_gates = true;
@@ -147,6 +158,14 @@ static THD_FUNCTION(shutdown_thread, arg) {
 	(void)arg;
 
 	chRegSetThreadName("Shutdown");
+
+#ifdef HW_MINIM_FLIGHT
+	// The Minim has no power button (its sample is constant 1) and the flight
+	// build must never shut down, save backup data or act on shutdown_mode.
+	for (;;) {
+		chThdSleepMilliseconds(1000);
+	}
+#endif
 
 	bool gates_disabled_here = false;
 	float gate_disable_time = 0.0;

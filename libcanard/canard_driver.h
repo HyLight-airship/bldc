@@ -31,6 +31,8 @@ typedef struct {
 void canard_driver_init(void);
 uavcan_cmd_info canard_driver_last_rawcmd(int can_if);
 uavcan_cmd_info canard_driver_last_rpmcmd(int can_if);
+// Defined in the Minim flight build only (HW_MINIM_FLIGHT)
+float canard_driver_any_motor_cmd_age(void);
 int16_t canard_process_frame(CANRxFrame *msg, int interface);
 
 #endif /* LIBCANARD_CANARD_DRIVER_H_ */

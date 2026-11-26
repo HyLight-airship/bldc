@@ -228,6 +228,7 @@ bool conf_general_store_app_configuration(app_configuration *conf);
 void conf_general_read_mc_configuration(mc_configuration *conf, bool is_motor_2);
 bool conf_general_config_was_reset(void);
 bool conf_general_store_mc_configuration(mc_configuration *conf, bool is_motor_2);
+uint8_t conf_general_flight_check(void);
 bool conf_general_detect_motor_param(float current, float min_rpm, float low_duty,
 									 float *int_limit, float *bemf_coupling_k, int8_t *hall_table, int *hall_res);
 bool conf_general_measure_flux_linkage(float current, float duty,

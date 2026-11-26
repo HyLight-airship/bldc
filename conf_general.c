@@ -66,8 +66,95 @@ static volatile bool m_conf_loaded_defaults = false;
 
 // Private functions
 static bool read_eeprom_var(eeprom_var *v, int address, uint16_t base);
+#ifndef HW_MINIM_FLIGHT
 static bool store_eeprom_var(eeprom_var *v, int address, uint16_t base);
+#endif
 
+#ifdef HW_MINIM_FLIGHT
+#include "packet.h"
+
+// Airship flight build: the whole motor and app config is compiled into the
+// firmware and loaded at every boot. Flash is never read for config and never
+// written, so a rejected or stale stored config can no longer replace the
+// flight values with generic defaults.
+
+// State for conf_general_flight_check(): the compiled reference configs and
+// the serialized buffers. All static, so the check takes nothing from the
+// shared mempools or the packet buffer. One mutex, local to the check, guards
+// all of it; a second caller does not wait, it gets the last result.
+static MUTEX_DECL(m_flight_check_mtx);
+static mc_configuration m_flight_check_mc_ref;
+static app_configuration m_flight_check_app_ref;
+static uint8_t m_flight_check_buf_live[PACKET_MAX_PL_LEN];
+static uint8_t m_flight_check_buf_ref[PACKET_MAX_PL_LEN];
+static volatile uint8_t m_flight_check_last = FAULT_CODE_NONE;
+#endif
+
+#ifdef HW_MINIM_FLIGHT
+__attribute__((section(".text2"))) void conf_general_init(void) {
+	// The virtual address table is still filled so that read only access to the
+	// emulated EEPROM (eeprom vars) finds its variables. EE_Init() is not called:
+	// it can erase and format flash pages.
+	memset(VirtAddVarTab, 0, sizeof(VirtAddVarTab));
+
+	int ind = 0;
+	for (unsigned int i = 0;i < (sizeof(mc_configuration) / 2);i++) {
+		VirtAddVarTab[ind++] = EEPROM_BASE_MCCONF + i;
+	}
+
+	for (unsigned int i = 0;i < (sizeof(app_configuration) / 2);i++) {
+		VirtAddVarTab[ind++] = EEPROM_BASE_APPCONF + i;
+	}
+
+	for (unsigned int i = 0;i < (EEPROM_VARS_HW * 2);i++) {
+		VirtAddVarTab[ind++] = EEPROM_BASE_HW + i;
+	}
+
+	for (unsigned int i = 0;i < (EEPROM_VARS_CUSTOM * 2);i++) {
+		VirtAddVarTab[ind++] = EEPROM_BASE_CUSTOM + i;
+	}
+
+	for (unsigned int i = 0;i < (sizeof(backup_data) / 2);i++) {
+		VirtAddVarTab[ind++] = EEPROM_BASE_BACKUP + i;
+	}
+
+	// Backup data lives in RAM only. Odometer, runtime, hw config and encoder
+	// correction survive a warm reset in RAM4 when their init flags are valid,
+	// otherwise they start from zero. The CAN fields always take the compiled
+	// values, never a stored one.
+	backup_data backup_tmp;
+	memset(&backup_tmp, 0, sizeof(backup_data));
+
+	if (g_backup.odometer_init_flag == BACKUP_VAR_INIT_CODE) {
+		backup_tmp.odometer = g_backup.odometer;
+	}
+
+	if (g_backup.runtime_init_flag == BACKUP_VAR_INIT_CODE) {
+		backup_tmp.runtime = g_backup.runtime;
+	}
+
+	if (g_backup.hw_config_init_flag == BACKUP_VAR_INIT_CODE) {
+		memcpy((void*)backup_tmp.hw_config, (uint8_t*)g_backup.hw_config, sizeof(g_backup.hw_config));
+	}
+
+	if (g_backup.enc_corr_init_flag == BACKUP_VAR_INIT_CODE) {
+		memcpy((void*)backup_tmp.enc_corr, (uint8_t*)g_backup.enc_corr, sizeof(g_backup.enc_corr));
+		backup_tmp.enc_corr_en = g_backup.enc_corr_en;
+	}
+
+	backup_tmp.can_baud = APPCONF_CAN_BAUD_RATE;
+	backup_tmp.can_id = HW_DEFAULT_ID;
+	backup_tmp.uavcan_esc_index = APPCONF_UAVCAN_ESC_INDEX;
+
+	backup_tmp.odometer_init_flag = BACKUP_VAR_INIT_CODE;
+	backup_tmp.runtime_init_flag = BACKUP_VAR_INIT_CODE;
+	backup_tmp.hw_config_init_flag = BACKUP_VAR_INIT_CODE;
+	backup_tmp.enc_corr_init_flag = BACKUP_VAR_INIT_CODE;
+	backup_tmp.can_init_flag = BACKUP_VAR_INIT_CODE;
+
+	g_backup = backup_tmp;
+}
+#else
 __attribute__((section(".text2"))) void conf_general_init(void) {
 	// First, make sure that all relevant virtual addresses are assigned for page swapping.
 	memset(VirtAddVarTab, 0, sizeof(VirtAddVarTab));
@@ -158,6 +245,7 @@ __attribute__((section(".text2"))) void conf_general_init(void) {
 	g_backup = backup_tmp;
 	conf_general_store_backup_data();
 }
+#endif
 
 /*
  * Store backup data to emulated eeprom. Currently this is only done from the shutdown function, which
@@ -167,6 +255,11 @@ __attribute__((section(".text2"))) void conf_general_init(void) {
  * app config to get lost.
  */
 __attribute__((section(".text2"))) bool conf_general_store_backup_data(void) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: backup data stays in RAM. Nothing is written and the motor
+	// is not stopped. Reported as done so that shutdown and restart paths go on.
+	return true;
+#else
 	mc_interface_ignore_input_both(5000);
 	mc_interface_release_motor_override_both();
 
@@ -201,6 +294,7 @@ __attribute__((section(".text2"))) bool conf_general_store_backup_data(void) {
 	utils_sys_unlock_cnt();
 
 	return is_ok;
+#endif
 }
 
 /**
@@ -254,10 +348,18 @@ __attribute__((section(".text2"))) bool conf_general_read_eeprom_var_custom(eepr
  * true for success, false if something went wrong.
  */
 __attribute__((section(".text2"))) bool conf_general_store_eeprom_var_hw(eeprom_var *v, int address) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: flash is never written. Reported as not stored, so a caller
+	// does not believe the value will be there after a reboot.
+	(void)v;
+	(void)address;
+	return false;
+#else
 	if (address < 0 || address >= EEPROM_VARS_HW) {
 		return false;
 	}
 	return store_eeprom_var(v, address, EEPROM_BASE_HW);
+#endif
 }
 
 /**
@@ -273,10 +375,18 @@ __attribute__((section(".text2"))) bool conf_general_store_eeprom_var_hw(eeprom_
  * true for success, false if something went wrong.
  */
 __attribute__((section(".text2"))) bool conf_general_store_eeprom_var_custom(eeprom_var *v, int address) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: flash is never written. Reported as not stored, so a caller
+	// does not believe the value will be there after a reboot.
+	(void)v;
+	(void)address;
+	return false;
+#else
 	if (address < 0 || address >= EEPROM_VARS_CUSTOM) {
 		return false;
 	}
 	return store_eeprom_var(v, address, EEPROM_BASE_CUSTOM);
+#endif
 }
 
 __attribute__((section(".text2"))) static bool read_eeprom_var(eeprom_var *v, int address, uint16_t base) {
@@ -294,6 +404,7 @@ __attribute__((section(".text2"))) static bool read_eeprom_var(eeprom_var *v, in
 	return is_ok;
 }
 
+#ifndef HW_MINIM_FLIGHT
 __attribute__((section(".text2"))) static bool store_eeprom_var(eeprom_var *v, int address, uint16_t base) {
 	bool is_ok = true;
 	uint16_t var0, var1;
@@ -332,6 +443,7 @@ __attribute__((section(".text2"))) static bool store_eeprom_var(eeprom_var *v, i
 
 	return is_ok;
 }
+#endif
 
 /**
  * Read app_configuration from EEPROM. If this fails, default values will be used.
@@ -340,6 +452,15 @@ __attribute__((section(".text2"))) static bool store_eeprom_var(eeprom_var *v, i
  * A pointer to a app_configuration struct to write the read configuration to.
  */
 __attribute__((section(".text2"))) void conf_general_read_app_configuration(app_configuration *conf) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: always the compiled app config, flash is not read. The
+	// controller id, CAN baud rate and UAVCAN ESC index are the compiled per pod
+	// values (HW_DEFAULT_ID, APPCONF_CAN_BAUD_RATE, APPCONF_UAVCAN_ESC_INDEX),
+	// not the backup copy. m_conf_loaded_defaults stays false: these are the
+	// intended values, not a fallback.
+	confgenerator_set_defaults_appconf(conf);
+	conf->crc = app_calc_crc(conf);
+#else
 	bool is_ok = true;
 	uint8_t *conf_addr = (uint8_t*)conf;
 	uint16_t var;
@@ -374,6 +495,7 @@ __attribute__((section(".text2"))) void conf_general_read_app_configuration(app_
 		conf->controller_id = g_backup.can_id;
 		conf->uavcan_esc_index = g_backup.uavcan_esc_index;
 	}
+#endif
 }
 
 /**
@@ -383,6 +505,14 @@ __attribute__((section(".text2"))) void conf_general_read_app_configuration(app_
  * A pointer to the configuration that should be stored.
  */
 __attribute__((section(".text2"))) bool conf_general_store_app_configuration(app_configuration *conf) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: the app config is compiled in, nothing is written and the
+	// motor is not stopped. Reported as done: callers apply the config in RAM
+	// right after, and conf_general_flight_check() reports any difference from
+	// the compiled config.
+	(void)conf;
+	return true;
+#else
 	mc_interface_ignore_input_both(5000);
 	mc_interface_release_motor_override_both();
 
@@ -435,6 +565,7 @@ __attribute__((section(".text2"))) bool conf_general_store_app_configuration(app
 	conf_general_store_backup_data();
 
 	return is_ok;
+#endif
 }
 
 /**
@@ -444,6 +575,12 @@ __attribute__((section(".text2"))) bool conf_general_store_app_configuration(app
  * A pointer to a mc_configuration struct to write the read configuration to.
  */
 __attribute__((section(".text2"))) void conf_general_read_mc_configuration(mc_configuration *conf, bool is_motor_2) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: always the compiled motor config, flash is not read. The
+	// current and voltage offsets are measured at boot (foc_offsets_cal_mode).
+	confgenerator_set_defaults_mcconf(conf);
+	conf->crc = mc_interface_calc_crc(conf, is_motor_2);
+#else
 	bool is_ok = true;
 	uint8_t *conf_addr = (uint8_t*)conf;
 	uint16_t var;
@@ -475,6 +612,7 @@ __attribute__((section(".text2"))) void conf_general_read_mc_configuration(mc_co
 		m_conf_loaded_defaults = true;
 		confgenerator_set_defaults_mcconf(conf);
 	}
+#endif
 }
 
 // True if the stored motor or app config was invalid at boot and defaults were loaded.
@@ -489,6 +627,15 @@ bool conf_general_config_was_reset(void) {
  * A pointer to the configuration that should be stored.
  */
 __attribute__((section(".text2"))) bool conf_general_store_mc_configuration(mc_configuration *conf, bool is_motor_2) {
+#ifdef HW_MINIM_FLIGHT
+	// Flight build: the motor config is compiled in, nothing is written and the
+	// motor is not stopped. Reported as done: callers apply the config in RAM
+	// right after, and conf_general_flight_check() reports any difference from
+	// the compiled config.
+	(void)conf;
+	(void)is_motor_2;
+	return true;
+#else
 	mc_interface_ignore_input_both(5000);
 	mc_interface_release_motor_override_both();
 
@@ -525,6 +672,76 @@ __attribute__((section(".text2"))) bool conf_general_store_mc_configuration(mc_c
 	utils_sys_unlock_cnt();
 
 	return is_ok;
+#endif
+}
+
+/**
+ * Compare the live motor and app config with the config compiled into the
+ * flight build.
+ *
+ * The comparison runs on the confgenerator serialized form, so runtime fields
+ * outside the serialized set do not count. The boot calibrated current and
+ * voltage offsets are copied from the live config into the reference first,
+ * since they are measured per unit at every boot. It only reads the live
+ * configs and never stops or waits on the motor, so it can run at about 1 Hz
+ * from a low priority thread.
+ *
+ * @return
+ * 0 if both configs match the compiled ones (and always 0 outside the flight
+ * build), FAULT_CODE_FLASH_CORRUPTION_APP_CFG if the app config differs,
+ * FAULT_CODE_FLASH_CORRUPTION_MC_CFG if the motor config differs. The app
+ * config is checked first.
+ */
+uint8_t conf_general_flight_check(void) {
+#ifdef HW_MINIM_FLIGHT
+	// Never waits: if another thread is running the check, return the result
+	// of the last completed check instead of blocking.
+	if (!chMtxTryLock(&m_flight_check_mtx)) {
+		return m_flight_check_last;
+	}
+
+	uint8_t res = FAULT_CODE_NONE;
+
+	// App config: serialized straight from the live struct.
+	const app_configuration *app_live = app_get_configuration();
+	confgenerator_set_defaults_appconf(&m_flight_check_app_ref);
+
+	int32_t len_live = confgenerator_serialize_appconf(m_flight_check_buf_live, app_live);
+	int32_t len_ref = confgenerator_serialize_appconf(m_flight_check_buf_ref, &m_flight_check_app_ref);
+
+	if (len_live != len_ref ||
+			memcmp(m_flight_check_buf_live, m_flight_check_buf_ref, (size_t)len_ref) != 0) {
+		res = FAULT_CODE_FLASH_CORRUPTION_APP_CFG;
+	}
+
+	// Motor config
+	if (res == FAULT_CODE_NONE) {
+		volatile const mc_configuration *mc_live = mc_interface_get_configuration();
+		confgenerator_set_defaults_mcconf(&m_flight_check_mc_ref);
+
+		// Per unit offsets measured at boot
+		for (int i = 0;i < 3;i++) {
+			m_flight_check_mc_ref.foc_offsets_current[i] = mc_live->foc_offsets_current[i];
+			m_flight_check_mc_ref.foc_offsets_voltage[i] = mc_live->foc_offsets_voltage[i];
+			m_flight_check_mc_ref.foc_offsets_voltage_undriven[i] = mc_live->foc_offsets_voltage_undriven[i];
+		}
+
+		len_live = confgenerator_serialize_mcconf(m_flight_check_buf_live, (const mc_configuration*)mc_live);
+		len_ref = confgenerator_serialize_mcconf(m_flight_check_buf_ref, &m_flight_check_mc_ref);
+
+		if (len_live != len_ref ||
+				memcmp(m_flight_check_buf_live, m_flight_check_buf_ref, (size_t)len_ref) != 0) {
+			res = FAULT_CODE_FLASH_CORRUPTION_MC_CFG;
+		}
+	}
+
+	m_flight_check_last = res;
+	chMtxUnlock(&m_flight_check_mtx);
+
+	return res;
+#else
+	return 0;
+#endif
 }
 
 __attribute__((section(".text2"))) bool conf_general_detect_motor_param(float current, float min_rpm, float low_duty,

@@ -816,6 +816,11 @@ void comm_can_conf_battery_cut(uint8_t controller_id,
 }
 
 void comm_can_shutdown(uint8_t controller_id) {
+#ifdef HW_MINIM_FLIGHT
+	// The flight build never asks other ESCs to shut down
+	(void)controller_id;
+	return;
+#endif
 	int32_t send_index = 0;
 	uint8_t buffer[8];
 	comm_can_transmit_eid_replace(controller_id |
@@ -1339,6 +1344,14 @@ static THD_FUNCTION(cancom_read_thread, arg) {
 }
 
 static void process_frame_vesc(CANRxFrame rxmsg) {
+#ifdef HW_MINIM_FLIGHT
+	// While the motor is busy no VESC-protocol frame is interpreted, as in
+	// CAN_MODE_UAVCAN. UAVCAN frames are handled before this point.
+	if (hw_minim_flight_busy()) {
+		return;
+	}
+#endif
+
 	if (rxmsg.IDE == CAN_IDE_EXT) {
 		bool eid_cb_used = false;
 		if (eid_callback) {
@@ -1609,6 +1622,41 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len, bool is_replaced) 
 #endif
 
 	// The packets here are addressed to this VESC or to all VESCs (id=255)
+
+#ifdef HW_MINIM_FLIGHT
+	// The flight build is driven by UAVCAN only and its config is fixed at
+	// compile time: motor commands, config writes, detection, the CAN
+	// shutdown and the baud change are ignored at all times.
+	switch (cmd) {
+	case CAN_PACKET_SET_DUTY:
+	case CAN_PACKET_SET_CURRENT:
+	case CAN_PACKET_SET_CURRENT_BRAKE:
+	case CAN_PACKET_SET_RPM:
+	case CAN_PACKET_SET_POS:
+	case CAN_PACKET_SET_CURRENT_REL:
+	case CAN_PACKET_SET_CURRENT_BRAKE_REL:
+	case CAN_PACKET_SET_CURRENT_HANDBRAKE:
+	case CAN_PACKET_SET_CURRENT_HANDBRAKE_REL:
+	case CAN_PACKET_DETECT_APPLY_ALL_FOC:
+	case CAN_PACKET_CONF_CURRENT_LIMITS:
+	case CAN_PACKET_CONF_STORE_CURRENT_LIMITS:
+	case CAN_PACKET_CONF_CURRENT_LIMITS_IN:
+	case CAN_PACKET_CONF_STORE_CURRENT_LIMITS_IN:
+	case CAN_PACKET_CONF_FOC_ERPMS:
+	case CAN_PACKET_CONF_STORE_FOC_ERPMS:
+	case CAN_PACKET_CONF_BATTERY_CUT:
+	case CAN_PACKET_CONF_STORE_BATTERY_CUT:
+	case CAN_PACKET_SHUTDOWN:
+	case CAN_PACKET_UPDATE_PID_POS_OFFSET:
+	case CAN_PACKET_UPDATE_BAUD:
+#ifdef HW_HAS_DUAL_MOTORS
+		mc_interface_select_motor_thread(motor_last);
+#endif
+		return;
+	default:
+		break;
+	}
+#endif
 
 	if (id == 255 || id == id1 || id == id2) {
 		switch (cmd) {
@@ -2004,7 +2052,7 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len, bool is_replaced) 
 		} break;
 
 		case CAN_PACKET_SHUTDOWN: {
-#ifdef HW_SHUTDOWN_HOLD_ON
+#if defined(HW_SHUTDOWN_HOLD_ON) && !defined(HW_MINIM_FLIGHT)
 			SHUTDOWN_SET_SAMPLING_DISABLED(true);
 			mc_interface_lock();
 			DISABLE_GATE();

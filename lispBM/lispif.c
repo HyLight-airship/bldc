@@ -32,6 +32,7 @@
 #include "stm32f4xx_conf.h"
 #include "lbm_prof.h"
 #include "utils.h"
+#include "hw.h"
 
 #define LBM_MEMORY_SIZE_28K LBM_MEMORY_SIZE_64BYTES_TIMES_X(448)
 #define LBM_MEMORY_BITMAP_SIZE_28K LBM_MEMORY_BITMAP_SIZE(448)
@@ -91,9 +92,14 @@ void lispif_init(void) {
 	// Do not attempt to start lisp after a watchdog reset, in case lisp
 	// was the cause of it.
 	// TODO: Anything else to check?
+#ifdef HW_MINIM_FLIGHT
+	// The flight build never starts the stored script at boot: scripts can
+	// drive the motor, and the zero command release is done in the UAVCAN driver.
+#else
 	if (!timeout_had_IWDG_reset() && terminal_get_first_fault() != FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET) {
 		lispif_restart(false, true, true);
 	}
+#endif
 
 #ifdef LBM_USE_TIME_QUOTA
 	lbm_set_eval_time_quota(2000);

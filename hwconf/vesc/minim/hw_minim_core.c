@@ -33,6 +33,9 @@
 #include "app.h"
 #include "comm_can.h"
 #include "shutdown.h"
+#ifdef HW_MINIM_FLIGHT
+#include "canard_driver.h"
+#endif
 
 typedef enum {
 	SWITCH_BOOTED = 0,
@@ -425,6 +428,12 @@ void hw_try_restore_i2c(void) {
 }
 
 bool smart_switch_is_pressed(void) {
+#ifdef HW_MINIM_FLIGHT
+	// The power switch input is bridged and PA5 holds the power latch, so the
+	// pin is never sampled as a button: sampling releases the output.
+	return false;
+#endif
+
 	chMtxLock(&shutdown_mutex);
 
 	if (shutdown_sample_dis) {
@@ -459,6 +468,15 @@ bool smart_switch_is_pressed(void) {
 }
 
 void hw_shutdown_set_hold(bool hold) {
+#ifdef HW_MINIM_FLIGHT
+	// The power hold is never released in the flight build
+	(void)hold;
+	shutdown_hold_en = true;
+	palSetPadMode(SWITCH_OUT_GPIO, SWITCH_OUT_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+	palSetPad(SWITCH_OUT_GPIO, SWITCH_OUT_PIN);
+	return;
+#endif
+
 	shutdown_hold_en = hold;
 
 	if (hold) {
@@ -470,8 +488,57 @@ void hw_shutdown_set_hold(bool hold) {
 }
 
 void smart_switch_shut_down(void) {
+#ifdef HW_MINIM_FLIGHT
+	// Reached through HW_SHUTDOWN_HOLD_OFF(). No shutdown in the flight build,
+	// the hold output stays high.
+	palSetPad(SWITCH_OUT_GPIO, SWITCH_OUT_PIN);
+#else
 	switch_state = SWITCH_SHUTTING_DOWN;
+#endif
 }
+
+#ifdef HW_MINIM_FLIGHT
+/*
+ * True while the motor is not idle: not off, still turning, or commanded
+ * non zero by UAVCAN within the last 3 s. Packets and services that could
+ * reconfigure, restart or stop the ESC are refused while this is true.
+ *
+ * The rpm threshold is 300 ERPM, a third of s_pid_min_erpm (900): the speed
+ * loop gives up below 900 ERPM, so a propeller coasting between 300 and 900
+ * ERPM is still counted as turning, while sensor noise at standstill (a few
+ * ERPM to tens of ERPM) stays below it.
+ */
+#define FLIGHT_BUSY_ERPM			300.0
+#define FLIGHT_BUSY_CMD_AGE_S		3.0
+
+static bool flight_cmd_recent(uavcan_cmd_info c) {
+	return c.value != 0.0 && c.age < FLIGHT_BUSY_CMD_AGE_S;
+}
+
+bool hw_minim_flight_busy(void) {
+	if (mc_interface_get_state() != MC_STATE_OFF) {
+		return true;
+	}
+
+	if (fabsf(mc_interface_get_rpm()) > FLIGHT_BUSY_ERPM) {
+		return true;
+	}
+
+	if (flight_cmd_recent(canard_driver_last_rawcmd(1)) ||
+			flight_cmd_recent(canard_driver_last_rawcmd(2)) ||
+			flight_cmd_recent(canard_driver_last_rpmcmd(1)) ||
+			flight_cmd_recent(canard_driver_last_rpmcmd(2))) {
+		return true;
+	}
+
+	// Any motor of the ship commanded non zero: armed, even if this one is at 0
+	if (canard_driver_any_motor_cmd_age() < FLIGHT_BUSY_CMD_AGE_S) {
+		return true;
+	}
+
+	return false;
+}
+#endif
 
 static THD_FUNCTION(switch_color_thread, arg) {
 	(void)arg;
@@ -591,6 +658,14 @@ static THD_FUNCTION(smart_switch_thread, arg) {
 			break;
 
 		case SWITCH_TURNED_ON:
+#ifdef HW_MINIM_FLIGHT
+			// Steady LED, no sampling, no shutdown in any shutdown_mode
+			(void)conf;
+			(void)switch_pressed_ts;
+			switch_bright = 1.0;
+			chThdSleepMilliseconds(100);
+			break;
+#endif
 			if (conf->shutdown_mode == SHUTDOWN_MODE_ALWAYS_OFF) {
 				switch_bright = 1.0;
 
@@ -621,6 +696,11 @@ static THD_FUNCTION(smart_switch_thread, arg) {
 			break;
 
 		case SWITCH_SHUTTING_DOWN:
+#ifdef HW_MINIM_FLIGHT
+			// Never entered in the flight build, return to the on state
+			switch_state = SWITCH_TURNED_ON;
+			break;
+#endif
 			switch_bright = 0;
 			systime_t tStart = chVTGetSystemTimeX();
 			while (smart_switch_is_pressed()) {

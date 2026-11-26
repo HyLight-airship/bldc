@@ -329,5 +329,8 @@ bool smart_switch_is_pressed(void);
 void hw_shutdown_set_hold(bool hold);
 void smart_switch_shut_down(void);
 void smart_switch_set_sampling_disabled(bool dis);
+#ifdef HW_MINIM_FLIGHT
+bool hw_minim_flight_busy(void);
+#endif
 
 #endif /* HW_MINIM_CORE_H_ */

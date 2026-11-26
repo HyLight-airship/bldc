@@ -329,7 +329,15 @@ int main(void) {
 		}
 	}
 
+#ifdef HW_MINIM_FLIGHT
+	// Airship flight build: nothing may erase or write flash at boot, so the
+	// shorted pin config reset is ignored. The pin check still runs so the
+	// pins end in the same state as in the normal build.
+	(void)should_reset_config();
+	bool cfg_reset = false;
+#else
 	bool cfg_reset = should_reset_config();
+#endif
 
 	// Also erase LBM and Qml on config reset
 	if (cfg_reset) {

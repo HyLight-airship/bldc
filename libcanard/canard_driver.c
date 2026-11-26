@@ -101,6 +101,15 @@ static uint8_t node_mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
 static int debug_level;
 static status_msg_wrapper_t stat_msgs[STATUS_MSGS_TO_STORE];
 static bool refresh_parameters_enabled = true;
+#ifdef HW_MINIM_FLIGHT
+// Zero raw command release, shared by both CAN interfaces since they drive one motor
+static bool raw_zero_active = false;
+static bool raw_zero_released = false;
+static systime_t raw_zero_start = 0;
+// Last RawCommand with a non zero value for any motor of the ship
+static volatile systime_t any_motor_cmd_time = 0;
+static volatile bool any_motor_cmd_seen = false;
+#endif
 
 // Threads
 static THD_WORKING_AREA(canard_thread_wa, 1024);
@@ -397,6 +406,20 @@ uavcan_cmd_info canard_driver_last_rawcmd(int can_if) {
 	return res;
 }
 
+#ifdef HW_MINIM_FLIGHT
+/**
+ * Seconds since a RawCommand carried a non zero value for any motor, on
+ * either interface. A large value when none was ever received.
+ */
+float canard_driver_any_motor_cmd_age(void) {
+	if (!any_motor_cmd_seen) {
+		return 1.0e6;
+	}
+
+	return UTILS_AGE_S(any_motor_cmd_time);
+}
+#endif
+
 uavcan_cmd_info canard_driver_last_rpmcmd(int can_if) {
 	uavcan_cmd_info res = {0};
 	res.age = UTILS_AGE_S(0);
@@ -584,6 +607,21 @@ static void sendEscStatus(CanardInstance *ins) {
 	if (fault == FAULT_CODE_NONE && conf_general_config_was_reset()) {
 		fault = FAULT_CODE_FLASH_CORRUPTION;
 	}
+#ifdef HW_MINIM_FLIGHT
+	// Without a motor fault, report whether the live config still equals the
+	// compiled flight config. The check runs at 1 Hz at most and is cached.
+	static uint8_t flight_check_res = 0;
+	static systime_t flight_check_time = 0;
+	static bool flight_check_done = false;
+	if (!flight_check_done || UTILS_AGE_S(flight_check_time) >= 1.0) {
+		flight_check_res = conf_general_flight_check();
+		flight_check_time = chVTGetSystemTimeX();
+		flight_check_done = true;
+	}
+	if (mc_interface_get_fault() == FAULT_CODE_NONE && flight_check_res != 0) {
+		fault = (mc_fault_code)flight_check_res;
+	}
+#endif
 	status.error_count = fault;
 	status.esc_index = app_get_configuration()->uavcan_esc_index;
 	status.power_rating_pct = (fabsf(mc_interface_get_tot_current()) /
@@ -758,6 +796,18 @@ static void handle_esc_raw_command(CanardInstance* ins, CanardRxTransfer* transf
 	uint8_t *tmp = msg_buffer;
 
 	if (uavcan_equipment_esc_RawCommand_decode_internal(transfer, transfer->payload_len, &cmd, &tmp, 0) >= 0) {
+#ifdef HW_MINIM_FLIGHT
+		// A non zero value for any motor means the ship is armed, even when this
+		// ESC's own value is 0 or trimmed from the array (trailing zeros).
+		for (int i = 0;i < (int)cmd.cmd.len;i++) {
+			if (cmd.cmd.data[i] != 0) {
+				any_motor_cmd_time = chVTGetSystemTimeX();
+				any_motor_cmd_seen = true;
+				break;
+			}
+		}
+#endif
+
 		if (cmd.cmd.len > app_get_configuration()->uavcan_esc_index) {
 			float raw_val = ((float)cmd.cmd.data[app_get_configuration()->uavcan_esc_index]) / 8192.0;
 
@@ -795,6 +845,37 @@ static void handle_esc_raw_command(CanardInstance* ins, CanardRxTransfer* transf
 					break;
 
 				case UAVCAN_RAW_MODE_RPM:
+#ifdef HW_MINIM_FLIGHT
+					// PX4 sends exactly 0 only when disarmed or killed. A speed
+					// command of 0 keeps the modulation on (duty 0 below
+					// s_pid_min_erpm), so the HFI keeps injecting. After 1 s of
+					// zeros the motor is released once, which stops the PWM, and
+					// stays released until a non zero command arrives.
+					if (cmd.cmd.data[app_get_configuration()->uavcan_esc_index] == 0) {
+						if (!raw_zero_active) {
+							raw_zero_active = true;
+							raw_zero_start = chVTGetSystemTimeX();
+						}
+
+						if (raw_zero_released) {
+							break;
+						}
+
+						if (UTILS_AGE_S(raw_zero_start) >= 1.0) {
+							// The release can be skipped while input is ignored, so it
+							// is repeated on each zero until the motor is seen OFF.
+							if (mc_interface_get_state() == MC_STATE_OFF) {
+								raw_zero_released = true;
+							} else {
+								mc_interface_release_motor();
+							}
+							break;
+						}
+					} else {
+						raw_zero_active = false;
+						raw_zero_released = false;
+					}
+#endif
 					mc_interface_set_pid_speed(raw_val * conf->uavcan_raw_rpm_max);
 					break;
 
@@ -833,8 +914,13 @@ static void handle_esc_rpm_command(CanardInstance* ins, CanardRxTransfer* transf
 			}
 #endif
 
+#ifdef HW_MINIM_FLIGHT
+			// PX4 drives the ESCs with RawCommand only. RPMCommand would let
+			// another node drive the motor, so it is ignored in the flight build.
+#else
 			mc_interface_set_pid_speed(rpm_val);
 			timeout_reset();
+#endif
 		}
 	}
 }
@@ -920,7 +1006,13 @@ static void handle_param_getset(CanardInstance* ins, CanardRxTransfer* transfer)
 	}
 
 	// If a valid parameter was retrived and this is a set parameter request...
+#ifdef HW_MINIM_FLIGHT
+	// The flight build config is fixed at compile time: a set is refused and
+	// the current value is returned as for a read.
+	if (false) {
+#else
 	if (p != NULL && req.name.len != 0 && req.value.union_tag != UAVCAN_PROTOCOL_PARAM_VALUE_EMPTY) {
+#endif
 		// Set request and valid parameter found
 		// Prevent overwrite of local parameter copy before its written to eeprom
 		refresh_parameters_enabled = false;
@@ -1040,6 +1132,12 @@ static void handle_restart_node(CanardInstance* ins, CanardRxTransfer* transfer)
 	uint64_t magic = 0;
 	bool ok = canardDecodeScalar(transfer, 0, 40, false, &magic) == 40 &&
 			magic == UAVCAN_PROTOCOL_RESTARTNODE_REQUEST_MAGIC_NUMBER;
+#ifdef HW_MINIM_FLIGHT
+	// No restart while the motor is busy, answered with ok = false
+	if (hw_minim_flight_busy()) {
+		ok = false;
+	}
+#endif
 
 	uint8_t resp = 0;
 	canardEncodeScalar(&resp, 0, 1, &ok);
@@ -1099,13 +1197,36 @@ static void send_fw_read(CanardInstance *ins)
 						   total_size);
 }
 
+#ifdef HW_MINIM_FLIGHT
 /*
- * Handle response to file read request. This is called when we recieve a response to 
+ * An update that is running when the motor becomes busy is aborted: no more
+ * flash writes, no more read requests and no jump to the bootloader.
+ * Returns true when busy.
+ */
+static bool flight_fw_update_abort_if_busy(void) {
+	if (!hw_minim_flight_busy()) {
+		return false;
+	}
+
+	fw_update.node_id = 0;
+	jump_to_bootloader = false;
+	return true;
+}
+#endif
+
+/*
+ * Handle response to file read request. This is called when we recieve a response to
  * send_fw_read() above. the packet contains a 16 bit value at the begining called 
  * error that needs to be removed before reading the file chunk
  */
 static void handle_file_read_response(CanardInstance* ins, CanardRxTransfer* transfer) {
 	(void)ins;
+
+#ifdef HW_MINIM_FLIGHT
+	if (flight_fw_update_abort_if_busy()) {
+		return;
+	}
+#endif
 
 	if ((transfer->transfer_id+1)%256 != fw_update.transfer_id ||
 		transfer->source_node_id != fw_update.node_id) {
@@ -1224,7 +1345,13 @@ static void handle_begin_firmware_update(CanardInstance* ins, CanardRxTransfer* 
 		return;
 	}
 
+#ifdef HW_MINIM_FLIGHT
+	// No firmware update while the motor is busy, answered INVALID_MODE
+	bool update_refused = hw_minim_flight_busy();
+	if (!update_refused && fw_update.node_id == 0) {
+#else
 	if (fw_update.node_id == 0) {
+#endif
 		uint32_t offset = 0;
 		canardDecodeScalar(transfer, 0, 8, false, (void*)&fw_update.node_id);
 		offset += 8;
@@ -1247,6 +1374,11 @@ static void handle_begin_firmware_update(CanardInstance* ins, CanardRxTransfer* 
 	memset(&reply, 0, sizeof(reply));
 
 	reply.error = UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_OK;
+#ifdef HW_MINIM_FLIGHT
+	if (update_refused) {
+		reply.error = UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_INVALID_MODE;
+	}
+#endif
 
 	uint32_t total_size = uavcan_protocol_file_BeginFirmwareUpdateResponse_encode(&reply, msg_buffer);
 	canardRequestOrRespond(ins,
@@ -1258,6 +1390,13 @@ static void handle_begin_firmware_update(CanardInstance* ins, CanardRxTransfer* 
 						   CanardResponse,
 						   &msg_buffer[0],
 						   total_size);
+
+#ifdef HW_MINIM_FLIGHT
+	// Refused: no erase and no read request
+	if (update_refused) {
+		return;
+	}
+#endif
 
 	// Erase the reserved flash for new app
 	flash_helper_erase_new_app(RESERVED_FLASH_SPACE_SIZE);
@@ -1553,6 +1692,10 @@ static THD_FUNCTION(canard_thread, arg) {
 				commands_printf("Refreshing Parameters Time Delta: %d", ST2MS(chVTGetSystemTimeX()-last_param_refresh));
 			}
 		}
+
+#ifdef HW_MINIM_FLIGHT
+		flight_fw_update_abort_if_busy();
+#endif
 
 		if ((ST2MS(chVTTimeElapsedSinceX(last_read_file_req)) >= 10) && (fw_update.node_id != 0)) {
 			last_read_file_req = chVTGetSystemTimeX();

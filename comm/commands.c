@@ -194,6 +194,99 @@ static void send_func_dummy(unsigned char *data, unsigned int len) {
  * @param len
  * The length of the buffer.
  */
+#ifdef HW_MINIM_FLIGHT
+/*
+ * Packet gate of the flight build. The motor is driven by UAVCAN only and the
+ * config is fixed at compile time.
+ *
+ * R  read only, answered at all times:
+ *    0 FW_VERSION, 4 GET_VALUES, 14 GET_MCCONF, 15 GET_MCCONF_DEFAULT,
+ *    17 GET_APPCONF, 18 GET_APPCONF_DEFAULT, 31 to 33 GET_DECODED_PPM/ADC/CHUK,
+ *    47 GET_VALUES_SETUP, 50 GET_VALUES_SELECTIVE, 51 GET_VALUES_SETUP_SELECTIVE,
+ *    65 GET_IMU_DATA, 79 GET_DECODED_BALANCE, 91 GET_MCCONF_TEMP,
+ *    92 to 94 GET_CUSTOM_CONFIG_XML/CONFIG/DEFAULT, 96 BMS_GET_VALUES,
+ *    111 PSW_GET_STATUS, 115 GET_BATTERY_CUT, 117 GET_QML_UI_HW,
+ *    118 GET_QML_UI_APP, 122 IO_BOARD_GET_ALL, 127 GET_EXT_HUM_TMP,
+ *    128 GET_STATS, 130 LISP_READ_CODE, 134 LISP_GET_STATS,
+ *    137 BMS_GET_BATT_TYPE, 150 GET_GNSS, 157 FW_INFO
+ * G  ground only, answered when the motor is not busy:
+ *    1 JUMP_TO_BOOTLOADER, 2 ERASE_NEW_APP, 3 WRITE_NEW_APP_DATA, 29 REBOOT,
+ *    30 ALIVE (resets the motor timeout), 34 FORWARD_CAN (the target ESC
+ *    gates the forwarded packet itself), 59 JUMP_TO_BOOTLOADER_ALL_CAN,
+ *    60 ERASE_NEW_APP_ALL_CAN, 61 WRITE_NEW_APP_DATA_ALL_CAN, 62 PING_CAN
+ *    (sends frames), 73 ERASE_BOOTLOADER, 74 ERASE_BOOTLOADER_ALL_CAN,
+ *    81 WRITE_NEW_APP_DATA_LZO, 82 WRITE_NEW_APP_DATA_ALL_CAN_LZO
+ * X  refused at all times, every other id, among them:
+ *    motor drive 5 to 10, 12, 84, 159 MOTOR_ESTOP, 63 APP_DISABLE_OUTPUT,
+ *    GPD 38 to 46; config writes 13, 16, 48, 49, 86, 89, 95, 110, 149, 158;
+ *    detection 11, 24 to 28, 57, 58, 90 GET_IMU_CALIBRATION (runs a
+ *    calibration); terminal 20, 64 (its commands can spin the motor);
+ *    lisp 131 to 133, 135, 138, 139, 152; QML 120, 121; BMS 97 to 101, 113,
+ *    114, 126, 136; files 140 to 144; logging 145 to 148, 151; 156 SHUTDOWN;
+ *    85 CAN_FWD_FRAME (raw frames); BLE 87, 88; bootloading other chips
+ *    66 to 72, 80, 83, 116, 125; other hardware updates 102 to 109;
+ *    19 SAMPLE_PRINT, 21 PRINT, 22 ROTOR_POSITION, 23 EXPERIMENT_SAMPLE,
+ *    35 SET_CHUCK_DATA, 36 CUSTOM_APP_DATA, 37 NRF_START_PAIRING,
+ *    52 to 56 EXT_NRF, 75 to 78 PLOT, 112 PSW_SWITCH, 119 CUSTOM_HW_DATA,
+ *    123, 124 IO_BOARD_SET, 129 RESET_STATS.
+ */
+static bool flight_packet_allowed(COMM_PACKET_ID id) {
+	switch (id) {
+	case COMM_FW_VERSION:
+	case COMM_GET_VALUES:
+	case COMM_GET_MCCONF:
+	case COMM_GET_MCCONF_DEFAULT:
+	case COMM_GET_APPCONF:
+	case COMM_GET_APPCONF_DEFAULT:
+	case COMM_GET_DECODED_PPM:
+	case COMM_GET_DECODED_ADC:
+	case COMM_GET_DECODED_CHUK:
+	case COMM_GET_VALUES_SETUP:
+	case COMM_GET_VALUES_SELECTIVE:
+	case COMM_GET_VALUES_SETUP_SELECTIVE:
+	case COMM_GET_IMU_DATA:
+	case COMM_GET_DECODED_BALANCE:
+	case COMM_GET_MCCONF_TEMP:
+	case COMM_GET_CUSTOM_CONFIG_XML:
+	case COMM_GET_CUSTOM_CONFIG:
+	case COMM_GET_CUSTOM_CONFIG_DEFAULT:
+	case COMM_BMS_GET_VALUES:
+	case COMM_PSW_GET_STATUS:
+	case COMM_GET_BATTERY_CUT:
+	case COMM_GET_QML_UI_HW:
+	case COMM_GET_QML_UI_APP:
+	case COMM_IO_BOARD_GET_ALL:
+	case COMM_GET_EXT_HUM_TMP:
+	case COMM_GET_STATS:
+	case COMM_LISP_READ_CODE:
+	case COMM_LISP_GET_STATS:
+	case COMM_BMS_GET_BATT_TYPE:
+	case COMM_GET_GNSS:
+	case COMM_FW_INFO:
+		return true;
+
+	case COMM_JUMP_TO_BOOTLOADER:
+	case COMM_ERASE_NEW_APP:
+	case COMM_WRITE_NEW_APP_DATA:
+	case COMM_REBOOT:
+	case COMM_ALIVE:
+	case COMM_FORWARD_CAN:
+	case COMM_JUMP_TO_BOOTLOADER_ALL_CAN:
+	case COMM_ERASE_NEW_APP_ALL_CAN:
+	case COMM_WRITE_NEW_APP_DATA_ALL_CAN:
+	case COMM_PING_CAN:
+	case COMM_ERASE_BOOTLOADER:
+	case COMM_ERASE_BOOTLOADER_ALL_CAN:
+	case COMM_WRITE_NEW_APP_DATA_LZO:
+	case COMM_WRITE_NEW_APP_DATA_ALL_CAN_LZO:
+		return !hw_minim_flight_busy();
+
+	default:
+		return false;
+	}
+}
+#endif
+
 void commands_process_packet(unsigned char *data, unsigned int len,
 		void(*reply_func)(unsigned char *data, unsigned int len)) {
 
@@ -206,6 +299,15 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	packet_id = data[0];
 	data++;
 	len--;
+
+#ifdef HW_MINIM_FLIGHT
+	// USB, UART, CAN (COMM_FORWARD_CAN, CAN_PACKET_PROCESS_RX_BUFFER and
+	// CAN_PACKET_PROCESS_SHORT_BUFFER) and Lisp all enter here, so this one
+	// gate covers every port. Refused packets are dropped silently.
+	if (!flight_packet_allowed(packet_id)) {
+		return;
+	}
+#endif
 
 	// The NRF51 ESB implementation is treated like it has its own
 	// independent communication interface.
